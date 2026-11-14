@@ -1,0 +1,13 @@
+{
+  "name": "free-model-aggregator-01-sichigatsu",
+  "version": "0.1.0",
+  "description": "Combinatorial Bayesian Risk Scorer and Scarcity-Aware Router",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
