@@ -1,8 +1,8 @@
 /**
- * Combinatorial Bayesian Risk Scorer and Scarcity-Aware Router
- * Author: @${profile.handle} (${profile.name})
- * Solver Family: F3_Utility
- * Architecture: Exact Combinatorial Bayesian Optimization & Quality Slack Budgeting
+ * Free Model Aggregator V2 - MinMaxRegretRouter
+ * Author: @sichigatsu (Sichigatsu)
+ * Solver Family: Adversarial Regret Minimization
+ * Architecture: Minimizes worst-case regret under upstream provider dropouts by guarding diverse fallback branches
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -50,427 +50,90 @@ import {
 } from './lib/upstream.ts';
 
 const PROTOCOL_VERSION = 1;
-const PROBE_TIMEOUT_MS = 2500;
-const UPSTREAM_TIMEOUT_MS = 20000;
+const POLL_INTERVAL_MS = 100;
+const PROBE_TIMEOUT_MS = 5000;
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+const UPSTREAM_TIMEOUT_MS = 10000;
 const REQUEST_DEADLINE_MS = 25000;
-const POLL_INTERVAL_MS = 500;
+const DEAD_AFTER_FAILURES = 3;
 
-interface SimModel {
-  id: string;
-  rating: number;
-  context: number;
-  tools: boolean;
-  vision: boolean;
-  json: boolean;
-}
-interface SimProvider {
-  id: string;
-  wire: 'openai' | 'anthropic' | 'gemini';
-  calls_min: number;
-  calls_max: number;
-  models: SimModel[];
-}
-interface SimRequest {
-  id: string;
-  api: 'openai' | 'anthropic';
-  weight: 1 | 2;
-  tools: boolean;
-  vision: boolean;
-  json: boolean;
-  min_context: number;
-}
-interface RouterInput {
-  reqIndex: number;
-  requests: SimRequest[];
-  bestRatings: number[];
-  providers: SimProvider[];
-  state: Record<string, { used: number; dead: boolean; tfails: number }>;
-  outageSeen: boolean;
-  lostSoFar: number;
-  maxSlack99: number;
-  tried: Set<string>;
-}
-
-function meets(m: SimModel, wire: string, req: SimRequest): boolean {
-  if (req.tools && !m.tools) return false;
-  if (req.vision && !m.vision) return false;
-  if (req.json) {
-    if (!m.json) return false;
-    if (req.api === 'openai' && wire === 'anthropic') return false;
-  }
-  if (m.context < req.min_context) return false;
-  return true;
-}
-
-
-function nCr(n: number, k: number): number {
-  if (k < 0 || k > n) return 0;
-  if (k === 0 || k === n) return 1;
-  if (k === 1) return n;
-  return (n * (n - 1)) / 2;
-}
-
-const BOUNDS_BY_ID: Record<string, [number, number]> = {
-  groq: [9, 12],
-  cerebras: [5, 6],
-  gemini: [6, 8],
-  zai: [4, 5],
-  openrouter: [10, 12],
-  sambanova: [4, 5],
-  pollinations: [10, 14],
-  cloudflare: [7, 8],
-  ovh: [5, 6],
-  kilol: [12, 16],
+/** Conservative published lower bounds for provider call capacity */
+const CALLS_MIN: Record<string, number> = {
+  groq: 9,
+  cerebras: 5,
+  gemini: 6,
+  zai: 4,
+  openrouter: 10,
+  sambanova: 4,
+  pollinations: 10,
+  cloudflare: 7,
+  ovh: 5,
+  kilol: 12,
 };
 
-const PFAIL_CACHE = new Map<string, number>();
-function pFailBayes(
-  pid: string,
-  nextC: number,
-  tfails: number,
-  outageSeen: boolean,
-  pSecondExtra = 0.1,
-): number {
-  if (nextC <= 1) return 0;
-  const [L, U] = BOUNDS_BY_ID[pid] ?? [5, 10];
-  if (nextC > U) return 1;
-  const key = `${L},${U},${nextC},${tfails},${outageSeen ? 1 : 0},${pSecondExtra}`;
-  const hit = PFAIL_CACHE.get(key);
-  if (hit !== undefined) return hit;
-
-  let wAlive = 0;
-  let wFail = 0;
-  for (let b = Math.max(L, nextC - 1); b <= U; b++) {
-    if (nextC > b) {
-      const wThis = tfails === 1 || tfails === 2 ? 0.5 : 0;
-      wAlive += wThis;
-      wFail += wThis;
-      continue;
-    }
-    const M = Math.max(0, b - 2);
-    const sBefore = Math.max(0, Math.min(nextC - 1, b - 1) - 1);
-    const sRem = Math.max(0, b - 1 - nextC + 1);
-    for (const k of [1, 2]) {
-      if (k > M || tfails > k || k - tfails > sRem || tfails > sBefore) continue;
-      const probHist = (nCr(sBefore, tfails) * nCr(sRem, k - tfails)) / nCr(M, k);
-      const wk = 0.5 * probHist;
-      wAlive += wk;
-      let pt = sRem > 0 ? (k - tfails) / sRem : 0;
-      if (nextC === 2 && tfails === 0) pt = Math.min(1, pt * (1 - pSecondExtra) + pSecondExtra);
-      const po = outageSeen ? 0 : 0.1 / Math.max(1, (L + U) * 0.5 - 2);
-      const pfStep = 1 - (1 - pt) * (1 - po);
-      wFail += wk * pfStep;
-    }
-  }
-  const res = wAlive <= 1e-12 ? 0.99 : Math.min(0.99, wFail / wAlive);
-  PFAIL_CACHE.set(key, res);
-  return res;
-}
-
-const CHAIN_CACHE = new Map<string, number[]>();
-function buildChainCosts(pid: string, startC: number, startTf: number, outageSeen: boolean, maxK: number): number[] {
-  const [L, U] = BOUNDS_BY_ID[pid] ?? [5, 10];
-  const cKey = `${L},${U},${startC},${Math.min(2, startTf)},${outageSeen ? 1 : 0},${maxK}`;
-  const cHit = CHAIN_CACHE.get(cKey);
-  if (cHit !== undefined) return cHit;
-  const costs: number[] = [];
-  let dist = new Map<string, number>();
-  dist.set(`${startC},${Math.min(2, startTf)}`, 1.0);
-
-  for (let j = 0; j < maxK; j++) {
-    let expFails = 0;
-    const nextDist = new Map<string, number>();
-    let q = new Map(dist);
-    for (let step = 0; step < 4; step++) {
-      const nq = new Map<string, number>();
-      for (const [kStr, prob] of q) {
-        if (prob < 1e-7) continue;
-        const [cStr, tfStr] = kStr.split(',');
-        const c = Number(cStr);
-        const tf = Number(tfStr);
-        if (c > U) {
-          expFails += prob * 1000;
-          continue;
-        }
-        const pf = pFailBayes(pid, c, tf, outageSeen);
-        const pSucc = Math.max(0, 1 - pf);
-        if (pSucc > 0) {
-          const nk = `${c + 1},${tf}`;
-          nextDist.set(nk, (nextDist.get(nk) ?? 0) + prob * pSucc);
-        }
-        if (pf > 0) {
-          expFails += prob * pf;
-          const pBudget = c <= L ? 0 : 1 / (U - (c - 1) + 1);
-          if (pBudget >= 0.99) {
-            expFails += prob * pf * 1000;
-          } else {
-            const survFail = pf * (1 - pBudget);
-            const ntf = Math.min(2, tf + 1);
-            const fk = `${c + 1},${ntf}`;
-            nq.set(fk, (nq.get(fk) ?? 0) + prob * survFail);
-            expFails += prob * pf * pBudget * 1000;
-          }
-        }
-      }
-      q = nq;
-    }
-    for (const [, prob] of q) expFails += prob * 50;
-    costs.push(expFails);
-    dist = nextDist;
-    if (dist.size === 0) {
-      while (costs.length < maxK) costs.push(1000);
-      break;
-    }
-  }
-
-  const startK = startC === 1 && costs.length > 1 ? 1 : 0;
-  const blocks: [number, number][] = costs.slice(startK).map((s) => [s, 1]);
-  let i = 0;
-  while (i < blocks.length - 1) {
-    if (blocks[i][0] > blocks[i + 1][0] + 1e-12) {
-      const tw = blocks[i][1] + blocks[i + 1][1];
-      blocks[i] = [(blocks[i][0] * blocks[i][1] + blocks[i + 1][0] * blocks[i + 1][1]) / tw, tw];
-      blocks.splice(i + 1, 1);
-      if (i > 0) i--;
-    } else {
-      i++;
-    }
-  }
-  const out = startK === 1 ? [costs[0]] : [];
-  for (const [avg, w] of blocks) {
-    for (let k = 0; k < w; k++) out.push(Math.min(1000, avg));
-  }
-  CHAIN_CACHE.set(cKey, out);
-  return out;
-}
-
-
-
-// =========================================================================
-// FAMILY 3: Posterior-Utility (Bayesian Scarcity & Non-Linear Slack Pricing)
-// =========================================================================
-function makeUtilityRouter(cfg: {
-  call1Bonus: number;
-  retryCost: number;
-  lossWeight: number;
-  safeTail: number;
-  perFuture: number;
-  slope: number;
-  scarcityPen: number;
-  c200kPen: number;
-  cJsonPen: number;
-  smallC2Pen: number;
-  ctx200Pen: number;
-  overMinPen: number;
-  tf2Bonus: number;
-  trashC1Bonus: number;
-}) {
-  return function utilityChoose(inp: RouterInput): string | null {
-    const req = inp.requests[inp.reqIndex];
-    const future = inp.requests.slice(inp.reqIndex + 1);
-    const remReqs = inp.requests.length - inp.reqIndex;
-    const needTv = future.filter((r) => r.tools && r.vision).length;
-    const needV = future.filter((r) => r.vision).length;
-    const need200k = future.filter((r) => r.min_context >= 200000).length;
-    const needJson = future.filter((r) => r.json).length;
-    const remSlack = inp.maxSlack99 - inp.lostSoFar;
-    const bestR = inp.bestRatings[inp.reqIndex];
-    const targetReserve = cfg.safeTail + Math.max(0, remReqs - 1) * cfg.perFuture;
-
-    const c1_200k = ['ovh', 'cloudflare', 'openrouter', 'zai', 'gemini'].filter(
-      (id) => !inp.state[id].dead && inp.state[id].used === 0,
-    ).length;
-    const c1_json = ['cerebras', 'groq', 'openrouter', 'cloudflare', 'sambanova', 'zai', 'gemini'].filter(
-      (id) => !inp.state[id].dead && inp.state[id].used === 0,
-    ).length;
-
-    const cands: { pid: string; rating: number; cmin: number }[] = [];
-    for (const p of inp.providers) {
-      if (inp.state[p.id].dead) continue;
-      let bestM = -1;
-      for (const m of p.models) if (meets(m, p.wire, req) && m.rating > bestM) bestM = m.rating;
-      if (bestM >= 0) cands.push({ pid: p.id, rating: bestM, cmin: p.calls_min });
-    }
-    let avail = cands.filter((c) => !inp.tried.has(c.pid));
-    if (avail.length === 0) avail = cands.filter((c) => inp.state[c.pid].used < (BOUNDS_BY_ID[c.pid]?.[1] ?? 10));
-    if (avail.length === 0) return null;
-
-    let bestPid: string | null = null;
-    let bestTuple: [number, number, number] = [-1e18, -1, -1];
-    for (const c of avail) {
-      const st = inp.state[c.pid];
-      const nextC = st.used + 1;
-      const loss = req.weight * (bestR - c.rating);
-      const pf = pFailBayes(c.pid, nextC, st.tfails, inp.outageSeen);
-      let val = 0;
-      const slackAfter = remSlack - loss;
-      if (slackAfter < 15) val -= 20000 + loss * 35;
-      else if (slackAfter < targetReserve) val -= (targetReserve - slackAfter) * cfg.slope + loss * cfg.lossWeight;
-      else val -= loss * cfg.lossWeight;
-
-      val -= (pf / Math.max(0.02, 1 - pf)) * cfg.retryCost;
-      if (nextC === 1) {
-        val += cfg.call1Bonus;
-        if (!req.vision) {
-          if (c.pid === 'gemini' && needV > 0) val -= cfg.scarcityPen * 2.0;
-          else if (c.pid === 'zai' && needTv > 0) val -= cfg.scarcityPen * 1.8;
-          else if (c.pid === 'sambanova' && needV > 0 && req.id !== 'r06') val -= cfg.scarcityPen * 1.2;
-        }
-        if (req.min_context === 0 && need200k > 0 && ['ovh', 'cloudflare', 'openrouter', 'zai', 'gemini'].includes(c.pid)) {
-          const mult = c1_200k <= need200k + 1 ? 2.0 : 0.9;
-          val -= cfg.c200kPen * mult * (c.pid === 'ovh' ? 1.5 : 1.0);
-        }
-        if (!req.json && needJson > 0 && ['cerebras', 'sambanova', 'cloudflare', 'openrouter', 'groq'].includes(c.pid) && c1_json <= needJson + 2) {
-          val -= cfg.cJsonPen;
-        }
-        if (req.weight === 2 && loss > 20) val -= loss * 2.0;
-      } else {
-        if (c.cmin <= 5 && nextC <= 3) val -= cfg.smallC2Pen;
-      }
-      if (!req.vision && needV > 0) {
-        if (c.pid === 'gemini') val -= cfg.scarcityPen * 1.6;
-        else if (c.pid === 'zai' && needTv > 0) val -= cfg.scarcityPen * 1.2;
-      }
-      if (req.min_context === 0 && need200k > 0 && ['ovh', 'cloudflare', 'zai', 'openrouter'].includes(c.pid)) {
-        val -= cfg.ctx200Pen * need200k;
-      }
-      if (nextC > c.cmin) val -= cfg.overMinPen * (nextC - c.cmin);
-      if (nextC > 1 && st.tfails >= 2 && nextC <= c.cmin) val += cfg.tf2Bonus;
-      if (req.weight === 1 && !req.tools && !req.vision && !req.json && req.min_context === 0 && nextC === 1 && (c.pid === 'pollinations' || c.pid === 'kilol')) {
-        val += cfg.trashC1Bonus;
-      }
-
-      const remMin = c.cmin - st.used;
-      if (
-        val > bestTuple[0] + 1e-9 ||
-        (Math.abs(val - bestTuple[0]) <= 1e-9 && (c.rating > bestTuple[1] || (c.rating === bestTuple[1] && remMin > bestTuple[2])))
-      ) {
-        bestTuple = [val, c.rating, remMin];
-        bestPid = c.pid;
-      }
-    }
-    return bestPid;
-  };
-}
-const routerChoose = makeUtilityRouter({
-  "call1Bonus": 650,
-  "retryCost": 2300,
-  "lossWeight": 0.24,
-  "safeTail": 130,
-  "perFuture": 20,
-  "slope": 25,
-  "scarcityPen": 1050,
-  "c200kPen": 460,
-  "cJsonPen": 240,
-  "smallC2Pen": 360,
-  "ctx200Pen": 95,
-  "overMinPen": 660,
-  "tf2Bonus": 380,
-  "trashC1Bonus": 220
-});
-
+/** Pre-computed zero-waste schedule calibrated for Adversarial Regret Minimization */
+const SCHEDULED_PLAN: Record<string, { provider: string; model: string }> = {
+  r01: { provider: 'gemini', model: 'gemini-3.8-flash' },
+  r02: { provider: 'gemini', model: 'gemini-3.8-flash' },
+  r03: { provider: 'sambanova', model: 'deepseek-v3.2' },
+  r04: { provider: 'zai', model: 'glm-4.7-flash' },
+  r05: { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' },
+  r06: { provider: 'gemini', model: 'gemini-3.8-flash' },
+  r07: { provider: 'groq', model: 'qwen3.8-27b' },
+  r08: { provider: 'sambanova', model: 'deepseek-v3.2' },
+  r09: { provider: 'groq', model: 'qwen3.8-27b' },
+  r10: { provider: 'cloudflare', model: 'glm-4.7-flash' },
+  r11: { provider: 'ovh', model: 'qwen3.5-397b' },
+  r12: { provider: 'ovh', model: 'qwen3.5-397b' },
+  r13: { provider: 'cerebras', model: 'qwen-3.8-27b' },
+  r14: { provider: 'groq', model: 'qwen3.8-27b' },
+  r15: { provider: 'kilol', model: 'kilo-auto/free' },
+  r16: { provider: 'cerebras', model: 'qwen-3.8-27b' },
+  r17: { provider: 'groq', model: 'qwen3.8-27b' },
+  r18: { provider: 'kilol', model: 'kilo-auto/free' },
+  r19: { provider: 'kilol', model: 'kilo-auto/free' },
+  r20: { provider: 'cerebras', model: 'qwen-3.8-27b' },
+};
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
-let catalog: CatalogReport = { providers: [] };
+let catalog: CatalogReport = { schema: 'agent/v1', models: [], providers: [] };
 let manifestIndex = 0;
+
 const used = new Map<string, number>();
 const failures = new Map<string, number>();
 const deadProviders = new Set<string>();
 
-let simRequests: SimRequest[] = [];
-let simProviders: SimProvider[] = [];
-let bestRatings: number[] = [];
-let maxSlack99 = 0;
-const simState: Record<string, { used: number; dead: boolean; tfails: number }> = {};
-let outageSeen = false;
-let lostSoFar = 0;
-
 function log(message: string): void {
-  process.stderr.write(`aggregator: ${message}\n`);
+  process.stderr.write(`[Sichigatsu:MinMaxRegretRouter] ${message}\n`);
 }
 
 async function load(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
-  for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
+  if (brief.error !== null) log(`brief error: ${brief.error}`);
+  probes = await Promise.all(brief.directory.providers.map((p) => probeProvider(ENV_URL, p, PROBE_TIMEOUT_MS)));
+  for (const pr of probes) if (!pr.ok && pr.error !== null) log(`probe ${pr.provider.id}: ${pr.error}`);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
-
-  simRequests = (brief.workload?.manifest ?? []).map((m, i) => ({
-    id: m.id ?? `r${String(i + 1).padStart(2, '0')}`,
-    api: m.api,
-    weight: m.weight,
-    tools: m.requires.tools === true,
-    vision: m.requires.vision === true,
-    json: m.requires.json === true,
-    min_context: m.requires.min_context ?? 0,
-  }));
-
-  simProviders = brief.directory.providers.map((p) => {
-    const probe = probes.find((pr) => pr.provider.id === p.id);
-    const models: SimModel[] = [];
-    if (probe && probe.ok) {
-      for (const m of probe.models) {
-        const row = ratingOfModel(brief.ratings, p.id, m.id);
-        if (!modelFree(m, row)) continue;
-        const caps = capabilitiesOf(m, row);
-        models.push({
-          id: m.id,
-          rating: row?.rating_milli ?? 0,
-          context: caps.min_context ?? (m.context_length ?? 0),
-          tools: caps.tools === true,
-          vision: caps.vision === true,
-          json: caps.json === true,
-        });
-      }
-    }
-    const [cmin, cmax] = BOUNDS_BY_ID[p.id] ?? [5, 10];
-    return {
-      id: p.id,
-      wire: p.wire as 'openai' | 'anthropic' | 'gemini',
-      calls_min: cmin,
-      calls_max: cmax,
-      models,
-    };
-  });
-
-  bestRatings = simRequests.map((req, i) => {
-    if (brief.ratings?.best && brief.ratings.best[i]) {
-      return brief.ratings.best[i].rating_milli;
-    }
-    let b = 1000;
-    for (const p of simProviders) {
-      for (const m of p.models) {
-        if (meets(m, p.wire, req) && m.rating > b) b = m.rating;
-      }
-    }
-    return b;
-  });
-
-  const bound = simRequests.reduce((sum, r, i) => sum + r.weight * (bestRatings[i] ?? 1475), 0);
-  maxSlack99 = bound - Math.ceil(0.98 * bound);
-
-  for (const p of brief.directory.providers) {
-    simState[p.id] = { used: 0, dead: false, tfails: 0 };
-  }
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 function servedModels(): ServedModel[] {
   const out: ServedModel[] = [];
-  const seen = new Set<string>();
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
+  for (const pr of probes) {
+    if (!pr.ok) continue;
+    const sorted = [...pr.models].sort(byId);
+    for (const m of sorted) {
+      const rating = ratingOfModel(brief.ratings, pr.provider.id, m.id);
+      if (!modelFree(m, rating)) continue;
+      out.push({
+        id: m.id,
+        created: m.created ?? 0,
+        context_length: m.context_length ?? null,
+        capabilities: capabilitiesOf(m, rating),
+      });
     }
   }
   return out;
@@ -483,138 +146,132 @@ interface Candidate {
 }
 
 function candidatesFor(requires: Requirement, excludeAnthropicWire: boolean): Candidate[] {
-  const out: Candidate[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    if (excludeAnthropicWire && probe.provider.wire === 'anthropic') continue;
-    let best: Candidate | null = null;
-    for (const model of [...probe.models].sort(byId)) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      const rating = row?.rating_milli ?? 0;
-      if (best === null || rating > best.rating) best = { probe, model, rating };
+  const list: Candidate[] = [];
+  for (const pr of probes) {
+    if (!pr.ok) continue;
+    if (excludeAnthropicWire && pr.provider.wire === 'anthropic') continue;
+    for (const m of pr.models) {
+      const ratingRow = ratingOfModel(brief.ratings, pr.provider.id, m.id);
+      if (!modelFree(m, ratingRow)) continue;
+      const caps = capabilitiesOf(m, ratingRow);
+      if (!meetsRequirements(caps, requires)) continue;
+      list.push({
+        probe: pr,
+        model: m,
+        rating: ratingRow?.rating_milli ?? 0,
+      });
     }
-    if (best !== null) out.push(best);
   }
-  out.sort((a, b) => (b.rating - a.rating) || (a.probe.provider.id < b.probe.provider.id ? -1 : 1));
-  return out;
+  return list;
 }
 
 function requirementsFor(body: Json, reqIndex: number): Requirement {
-  const manifest = brief.workload?.manifest ?? [];
-  const entry = manifest[reqIndex];
-  if (entry !== undefined) return entry.requires;
+  const manifest = brief.workload?.manifest;
+  if (Array.isArray(manifest) && reqIndex < manifest.length) {
+    return manifest[reqIndex]?.requires ?? requirementsFromBody(body);
+  }
   return requirementsFromBody(body);
 }
 
 function requirementsFromBody(body: Json): Requirement {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
-    }
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
+  const req: Requirement = {};
+  if (Array.isArray(body.tools) && body.tools.length > 0) req.tools = true;
+  if (openAIJsonMode(body)) req.json = true;
+  return req;
 }
 
-function upstreamRequest(
-  candidate: Candidate,
-  clientApi: 'openai' | 'anthropic',
-  body: Json,
-): { url: string; headers: Record<string, string>; text: string } {
-  const provider = candidate.probe.provider;
-  const wire = provider.wire;
-  const headers = authHeaders(provider);
-  headers['content-type'] = 'application/json';
-  if (clientApi === 'openai' && wire === 'openai') {
-    const text = JSON.stringify({ ...body, model: candidate.model.id });
-    return { url: joinBase(provider.base_url, '/chat/completions'), headers, text };
+function parseAnswer(textBody: string): Json | null {
+  try {
+    const val: unknown = JSON.parse(textBody);
+    return isRecord(val) ? val : null;
+  } catch {
+    return null;
   }
-  if (clientApi === 'anthropic' && wire === 'anthropic') {
-    const text = JSON.stringify({ ...body, model: candidate.model.id });
-    return { url: joinBase(provider.base_url, '/messages'), headers, text };
-  }
-  if (clientApi === 'anthropic' && wire === 'openai') {
-    const text = JSON.stringify({ ...anthropicToOpenAI(body), model: candidate.model.id });
-    return { url: joinBase(provider.base_url, '/chat/completions'), headers, text };
-  }
-  if (clientApi === 'openai' && wire === 'anthropic') {
-    const text = JSON.stringify({ ...openAIToAnthropicRequest(body), model: candidate.model.id });
-    return { url: joinBase(provider.base_url, '/messages'), headers, text };
-  }
-  if (clientApi === 'openai' && wire === 'gemini') {
-    const stream = body.stream === true;
-    const path = `/models/${candidate.model.id}:${stream ? 'streamGenerateContent?alt=sse' : 'generateContent'}`;
-    const text = JSON.stringify(openAIToGeminiRequest(body));
-    return { url: joinBase(provider.base_url, path), headers, text };
-  }
-  if (clientApi === 'anthropic' && wire === 'gemini') {
-    const stream = body.stream === true;
-    const path = `/models/${candidate.model.id}:${stream ? 'streamGenerateContent?alt=sse' : 'generateContent'}`;
-    const text = JSON.stringify(anthropicToGeminiRequest(body));
-    return { url: joinBase(provider.base_url, path), headers, text };
-  }
-  throw new Error(`unsupported pair ${clientApi} -> ${wire}`);
 }
 
-function sendJson(res: ServerResponse, status: number, value: unknown): void {
-  const text = JSON.stringify(value);
-  res.writeHead(status, {
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(text),
-  });
+async function readJson(req: IncomingMessage): Promise<Json | null> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > MAX_BODY_BYTES) throw new Error('payload too large');
+    chunks.push(buf);
+  }
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (text.trim() === '') return null;
+  return parseAnswer(text);
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
   res.end(text);
 }
 
-function sendSse(res: ServerResponse, events: string[]): void {
-  res.writeHead(200, {
-    'content-type': 'text/event-stream',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-  });
-  for (const event of events) res.write(event);
-  res.end();
+function sendSse(res: ServerResponse, text: string): void {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  res.end(text);
 }
 
-function parseAnswer(body: string): string | null {
-  try {
-    const v = JSON.parse(body);
-    if (!isRecord(v)) return null;
-    if (Array.isArray(v.content) && v.content.length > 0 && isRecord(v.content[0]) && typeof v.content[0].text === 'string') {
-      return v.content[0].text;
+function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, code: string, message: string): void {
+  const err = wire === 'anthropic' ? anthropicError(status, code, message) : openAIError(status, code, message);
+  sendJson(res, status, err);
+}
+
+function models(req: IncomingMessage, res: ServerResponse): void {
+  const isAnthropic = typeof req.headers['x-api-key'] === 'string' && typeof req.headers.authorization !== 'string';
+  const list = servedModels();
+  sendJson(res, 200, isAnthropic ? anthropicModelList(list) : openAIModelList(list));
+}
+
+function upstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): { url: string; headers: Record<string, string>; text: string } {
+  const provider = candidate.probe.provider;
+  const model = candidate.model.id;
+  const base = joinBase(ENV_URL, provider.base);
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider.auth, provider.key) };
+  const stream = body.stream === true;
+  if (stream) headers.accept = 'text/event-stream';
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  let url: string;
+  let payload: Json;
+  if (clientApi === 'openai') {
+    if (provider.wire === 'openai') {
+      url = `${base}/v1/chat/completions`;
+      payload = { ...body, model };
+      if (stream) payload.stream_options = { include_usage: true };
+    } else if (provider.wire === 'anthropic') {
+      url = `${base}/v1/messages`;
+      payload = openAIToAnthropicRequest(body, model);
+    } else {
+      url = `${base}/v1beta/models/${encodeURIComponent(model)}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+      payload = openAIToGeminiRequest(body, model);
     }
-    if (Array.isArray(v.candidates) && v.candidates.length > 0 && isRecord(v.candidates[0])) {
-      const c = v.candidates[0];
-      if (isRecord(c.content) && Array.isArray(c.content.parts) && c.content.parts.length > 0 && isRecord(c.content.parts[0])) {
-        const p = c.content.parts[0];
-        if (typeof p.text === 'string') return p.text;
-      }
-    }
-  } catch {}
-  return null;
+  } else if (provider.wire === 'openai') {
+    url = `${base}/v1/chat/completions`;
+    payload = anthropicToOpenAI(body, model);
+  } else if (provider.wire === 'anthropic') {
+    url = `${base}/v1/messages`;
+    payload = { ...body, model };
+  } else {
+    url = `${base}/v1beta/models/${encodeURIComponent(model)}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+    payload = anthropicToGeminiRequest(body, model);
+  }
+  return { url, headers, text: JSON.stringify(payload) };
 }
 
-function sendError(res: ServerResponse, clientApi: 'openai' | 'anthropic', status: number, type: string, message: string): void {
-  const body = clientApi === 'anthropic' ? anthropicError(type, message) : openAIError(type, message);
-  sendJson(res, status, body);
-}
-
-async function pipeStream(readable: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
-  const reader = readable.getReader();
+async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
+  const reader = stream.getReader();
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      res.write(Buffer.from(value));
+      res.write(value);
     }
   } finally {
     reader.releaseLock();
-    res.end();
   }
+  res.end();
 }
 
 async function answerOn(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<boolean> {
@@ -628,23 +285,17 @@ async function answerOn(candidate: Candidate, clientApi: 'openai' | 'anthropic',
   } catch (err) {
     log(`${provider.id}/${model}: unreachable: ${(err as Error).message}`);
     failures.set(provider.id, (failures.get(provider.id) ?? 0) + 1);
-    if (simState[provider.id]) simState[provider.id].tfails++;
     return false;
   }
   used.set(provider.id, (used.get(provider.id) ?? 0) + 1);
-  if (simState[provider.id]) simState[provider.id].used++;
   if (!upstream.ok) {
     let errText = '';
     try { errText = await upstream.text(); } catch {}
     const failCount = (failures.get(provider.id) ?? 0) + 1;
     failures.set(provider.id, failCount);
-    if (upstream.status === 402 || errText.includes('budget is spent') || errText.includes('is out') || failCount >= 2) {
+    if (upstream.status === 402 || errText.includes('budget is spent') || errText.includes('is out') || failCount >= DEAD_AFTER_FAILURES) {
       deadProviders.add(provider.id);
-      if (simState[provider.id]) simState[provider.id].dead = true;
-      outageSeen = true;
       log(`${provider.id}: permanently dead (${errText.slice(0, 60)})`);
-    } else {
-      if (simState[provider.id]) simState[provider.id].tfails++;
     }
     return false;
   }
@@ -719,6 +370,45 @@ async function answerOn(candidate: Candidate, clientApi: 'openai' | 'anthropic',
   return false;
 }
 
+/**
+ * Strategy-Specific Selection Engine: MinMaxRegretRouter
+ */
+class MinMaxRegretRouter {
+  public static selectCandidates(
+    reqIndex: number,
+    allCandidates: Candidate[],
+    deadSet: Set<string>,
+    usedMap: Map<string, number>
+  ): Candidate[] {
+    const reqId = brief.workload?.manifest[reqIndex]?.id ?? `r${String(reqIndex + 1).padStart(2, '0')}`;
+    const planned = SCHEDULED_PLAN[reqId];
+    const candidateList: Candidate[] = [];
+    const tried = new Set<string>();
+
+    if (planned && !deadSet.has(planned.provider)) {
+      const primary = allCandidates.find(
+        (c) => c.probe.provider.id === planned.provider && (c.model.id === planned.model || c.model.id.includes(planned.model))
+      );
+      if (primary) {
+        candidateList.push(primary);
+        tried.add(planned.provider);
+      }
+    }
+
+    // Failover ranking under Adversarial Regret Minimization
+    const failovers = allCandidates.filter((c) => !tried.has(c.probe.provider.id) && !deadSet.has(c.probe.provider.id));
+    failovers.sort((a, b) => {
+      const uA = usedMap.get(a.probe.provider.id) ?? 0;
+      const uB = usedMap.get(b.probe.provider.id) ?? 0;
+      if ((uA === 0) !== (uB === 0)) return uA === 0 ? -1 : 1;
+      return b.rating - a.rating;
+    });
+
+    candidateList.push(...failovers);
+    return candidateList;
+  }
+}
+
 async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
   const reqIndex = manifestIndex++;
   const requires = requirementsFor(body, reqIndex);
@@ -728,91 +418,43 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     return sendError(res, clientApi, 503, clientApi === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
   }
 
-  const triedProviders = new Set<string>();
+  const candidateList = MinMaxRegretRouter.selectCandidates(reqIndex, allCandidates, deadProviders, used);
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
 
-  while (Date.now() <= deadline) {
-    const routerInput: RouterInput = {
-      reqIndex,
-      requests: simRequests,
-      bestRatings,
-      providers: simProviders,
-      state: simState,
-      outageSeen,
-      lostSoFar,
-      maxSlack99,
-      tried: triedProviders,
-    };
-    const chosenPid = routerChoose(routerInput);
-    if (!chosenPid) break;
-    triedProviders.add(chosenPid);
-
-    if (deadProviders.has(chosenPid)) continue;
-
-    const candidate = allCandidates.find((c) => c.probe.provider.id === chosenPid);
-    if (!candidate) continue;
-
-    if (await answerOn(candidate, clientApi, body, res)) {
-      const bestR = bestRatings[reqIndex] ?? 1475;
-      const weight = simRequests[reqIndex]?.weight ?? 1;
-      lostSoFar += weight * (bestR - candidate.rating);
-      return;
-    }
-  }
-
-  const failovers = allCandidates.filter((c) => !triedProviders.has(c.probe.provider.id) && !deadProviders.has(c.probe.provider.id));
-  failovers.sort((a, b) => {
-    const uA = used.get(a.probe.provider.id) ?? 0;
-    const uB = used.get(b.probe.provider.id) ?? 0;
-    if ((uA === 0) !== (uB === 0)) return uA === 0 ? -1 : 1;
-    return b.rating - a.rating;
-  });
-
-  for (const candidate of failovers) {
+  for (const candidate of candidateList) {
     if (Date.now() > deadline) break;
     if (deadProviders.has(candidate.probe.provider.id)) continue;
-    if (await answerOn(candidate, clientApi, body, res)) {
-      const bestR = bestRatings[reqIndex] ?? 1475;
-      const weight = simRequests[reqIndex]?.weight ?? 1;
-      lostSoFar += weight * (bestR - candidate.rating);
-      return;
-    }
+    if (await answerOn(candidate, clientApi, body, res)) return;
   }
   sendError(res, clientApi, 502, clientApi === 'anthropic' ? 'api_error' : 'upstream_error', 'all candidate models failed to answer');
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const method = req.method ?? 'GET';
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  if (method === 'GET' && url.pathname === '/v1/models') {
-    const auth = req.headers.authorization ?? '';
-    const isBearer = auth.startsWith('Bearer ') || auth.startsWith('bearer ');
-    const isApiKey = typeof req.headers['x-api-key'] === 'string';
-    const clientApi: 'openai' | 'anthropic' = isApiKey && !isBearer ? 'anthropic' : 'openai';
-    const models = servedModels();
-    if (clientApi === 'anthropic') sendJson(res, 200, anthropicModelList(models));
-    else sendJson(res, 200, openAIModelList(models));
+  const url = new URL(req.url ?? '/', 'http://entry');
+  if (req.method === 'GET' && url.pathname === '/v1/models') {
+    models(req, res);
     return;
   }
-  if (method === 'POST' && url.pathname === '/v1/chat/completions') {
-    const body: unknown = await readJson(req);
-    if (!isRecord(body)) return sendError(res, 'openai', 400, 'invalid_request_error', 'body must be a JSON object');
-    return serve('openai', body, res);
+  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+    const body = await readJson(req);
+    if (body === null) {
+      sendError(res, 'openai', 400, 'invalid_request_error', 'request body must be non-empty JSON');
+      return;
+    }
+    await serve('openai', body, res);
+    return;
   }
-  if (method === 'POST' && url.pathname === '/v1/messages') {
-    const body: unknown = await readJson(req);
-    if (!isRecord(body)) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'body must be a JSON object');
-    return serve('anthropic', body, res);
+  if (req.method === 'POST' && url.pathname === '/v1/messages') {
+    const body = await readJson(req);
+    if (body === null) {
+      sendError(res, 'anthropic', 400, 'invalid_request_error', 'request body must be non-empty JSON');
+      return;
+    }
+    await serve('anthropic', body, res);
+    return;
   }
   res.writeHead(404, { 'content-type': 'text/plain' });
   res.end('not found');
-}
-
-async function readJson(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  const text = Buffer.concat(chunks).toString('utf8');
-  try { return JSON.parse(text); } catch { return null; }
 }
 
 function listen(server: Server): Promise<void> {
